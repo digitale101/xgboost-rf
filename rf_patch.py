@@ -15,6 +15,16 @@ Cosa cambia (solo src/common/random.h, classe ColumnSampler):
   se il campionamento per albero ha escluso tutto il gruppo di un livello, a
   quel livello si usa il gruppo intero.
 
+[RF_ENV] Su Windows XGBoost si compila con il runtime C STATICO (/MT, default
+di CMake per MSVC, opzione FORCE_SHARED_CRT=OFF): la DLL ha una sua copia
+dell'ambiente, fotografata quando viene caricata. std::getenv leggeva quella
+copia, quindi una variabile impostata da Python DOPO "import xgboost" non era
+mai vista e il filtro restava spento (selftest: stessi split con e senza
+gruppi). Ora su Windows la variabile si legge con GetEnvironmentVariableA,
+che interroga l'ambiente vero del processo, quello aggiornato da os.environ.
+La prima volta che un file di gruppi viene caricato (e a ogni cambio di file)
+compare un WARNING "[RF_GROUPS] attivi: ..." come conferma visibile.
+
 Lo script cerca punti di aggancio testuali: se la versione di XGBoost non
 li contiene si ferma con errore, senza modificare nulla a meta'.
 """
@@ -34,10 +44,14 @@ def must_replace(old, new, count=1):
 # 1) include
 must_replace('#include <vector>\n',
              '#include <vector>\n'
-             '#include <cstdlib>   // [RF_GROUPS] getenv\n'
+             '#include <cstdlib>   // [RF_GROUPS] getenv (non Windows)\n'
              '#include <fstream>   // [RF_GROUPS]\n'
              '#include <sstream>   // [RF_GROUPS]\n'
-             '#include <string>    // [RF_GROUPS]\n')
+             '#include <string>    // [RF_GROUPS]\n'
+             '#if defined(_WIN32)  // [RF_ENV] ambiente vero del processo, senza windows.h\n'
+             'extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(\n'
+             '    const char* lpName, char* lpBuffer, unsigned long nSize);\n'
+             '#endif\n')
 
 # 2) membri e funzioni di supporto, subito dopo ctx_
 must_replace('  Context const* ctx_;\n',
@@ -49,13 +63,32 @@ must_replace('  Context const* ctx_;\n',
   std::vector<std::vector<char>> rf_mask_;
   std::map<int, std::shared_ptr<HostDeviceVector<bst_feature_t>>> rf_level_cache_;
 
+  // [RF_ENV] legge una variabile d'ambiente dal processo. Su Windows NON usa
+  // std::getenv: con il runtime C statico vedrebbe solo l'ambiente presente al
+  // caricamento della DLL, non quello impostato dopo da os.environ.
+  static std::string RfGetEnv(const char* name) {
+#if defined(_WIN32)
+    std::vector<char> buf(32768, 0);
+    unsigned long n = GetEnvironmentVariableA(name, buf.data(),
+                                              static_cast<unsigned long>(buf.size()));
+    if (n == 0 || n >= buf.size()) {
+      return std::string();
+    }
+    return std::string(buf.data(), static_cast<std::size_t>(n));
+#else
+    const char* v = std::getenv(name);
+    return v == nullptr ? std::string() : std::string(v);
+#endif
+  }
+
   void RfLoadGroups(int64_t num_col) {
     rf_mask_.clear();
     rf_level_cache_.clear();
-    const char* path = std::getenv("XGB_RF_GROUPS_BY_LEVEL");
-    if (path == nullptr || path[0] == '\\0') {
+    const std::string path_s = RfGetEnv("XGB_RF_GROUPS_BY_LEVEL");  // [RF_ENV]
+    if (path_s.empty()) {
       return;
     }
+    const char* path = path_s.c_str();
     std::ifstream fin(path);
     if (!fin) {
       LOG(FATAL) << "[RF_GROUPS] impossibile aprire XGB_RF_GROUPS_BY_LEVEL=" << path;
@@ -86,6 +119,19 @@ must_replace('  Context const* ctx_;\n',
     }
     if (rf_mask_.empty()) {
       LOG(FATAL) << "[RF_GROUPS] nessun gruppo valido in " << path;
+    }
+    // [RF_ENV] conferma visibile, una volta per file (Init gira a ogni albero)
+    static std::string rf_last_logged;
+    if (rf_last_logged != path_s) {
+      rf_last_logged = path_s;
+      std::size_t n_feat = 0;
+      for (auto const& m : rf_mask_) {
+        for (char c : m) {
+          n_feat += (c != 0) ? 1 : 0;
+        }
+      }
+      LOG(WARNING) << "[RF_GROUPS] attivi: " << rf_mask_.size() << " gruppi, "
+                   << n_feat << " feature, file " << path_s;
     }
   }
 
