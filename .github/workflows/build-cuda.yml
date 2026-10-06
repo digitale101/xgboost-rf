@@ -5,7 +5,7 @@ name: build-xgboost-rf-cuda
 # Produce xgboost_rf-...whl in "Artifacts" (nome: xgboost_rf-3.2.0-rfgroups-
 # cuda-win). La build solo CPU (build.yml) resta intatta e separata.
 #
-# Perche' basta compilare: la patch tocca solo ColumnSampler
+# Perche' basta compilare: la patch tocca solo ColumnSampler 
 # (src/common/random.h), il componente che sceglie le feature ammesse a ogni
 # livello. Lo usano sia l'albero CPU (hist) sia quello GPU (cuda), e
 # l'elenco filtrato viene gia' assegnato al device del contesto
