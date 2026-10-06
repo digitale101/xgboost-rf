@@ -5,7 +5,7 @@ name: build-xgboost-rf-cuda
 # Produce xgboost_rf-...whl in "Artifacts" (nome: xgboost_rf-3.2.0-rfgroups-
 # cuda-win). La build solo CPU (build.yml) resta intatta e separata.
 #
-# Perche' basta compilare: la patch tocca solo ColumnSampler 
+# Perche' basta compilare: la patch tocca solo ColumnSampler
 # (src/common/random.h), il componente che sceglie le feature ammesse a ogni
 # livello. Lo usano sia l'albero CPU (hist) sia quello GPU (cuda), e
 # l'elenco filtrato viene gia' assegnato al device del contesto
@@ -19,9 +19,16 @@ name: build-xgboost-rf-cuda
 #   sola architettura accorcia molto la build.
 # - Generatore Ninja con l'ambiente MSVC (vcvars64): evita l'integrazione
 #   CUDA di Visual Studio/MSBuild, fonte tipica di errori sui runner.
-# - -allow-unsupported-compiler: l'MSVC dell'immagine GitHub puo' essere piu'
-#   recente di quelli dichiarati da CUDA 12.8; senza il flag nvcc rifiuta di
-#   partire anche quando funzionerebbe.
+# - [RF_CUDA_VS2022] Compilatore Microsoft di Visual Studio 2022 (toolset
+#   14.4x), quello che CUDA 12.8 supporta ufficialmente. Per questo il runner
+#   e' windows-2022 e vswhere cerca solo VS 2022 (versione [17.0,18.0)).
+#   Prima prova (6/10/2026) su windows-2025: l'immagine ha Visual Studio
+#   2026 (MSVC 19.51, toolset 14.51). nvcc lo rifiuta ("only the versions
+#   between 2017 and 2022") e con -allow-unsupported-compiler cudafe++ va in
+#   crash (ACCESS_VIOLATION) gia' nel rilevamento del compilatore di CMake.
+#   Il flag -allow-unsupported-compiler e' stato TOLTO: con VS 2022 non
+#   serve, e se un giorno il compilatore non fosse piu' supportato nvcc lo
+#   dice chiaramente invece di andare in crash a meta'.
 # - Toolkit installato COMPLETO (metodo "local"): piu' lento ma senza
 #   rischio di sottopacchetti mancanti (cudart, CCCL/thrust, nvtx...).
 # - Il runner non ha GPU: il selftest qui verifica la build CUDA
@@ -43,7 +50,9 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2025
+    # [RF_CUDA_VS2022] windows-2022 = Visual Studio 2022, supportato da
+    # CUDA 12.8 (windows-2025 ha VS 2026: non supportato, vedi sopra)
+    runs-on: windows-2022
     timeout-minutes: 300
     steps:
       - name: File di questo repository (patch e test)
@@ -87,7 +96,14 @@ jobs:
       - name: Compila xgboost.dll con MSVC + CUDA (sm_120)
         shell: cmd
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          rem [RF_CUDA_VS2022] solo Visual Studio 2022 (versioni 17.x): e' il
+          rem compilatore supportato da CUDA 12.8. Se manca, stop subito.
+          set "VSPATH="
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH (
+            echo ERRORE [RF_CUDA_VS2022] Visual Studio 2022 non trovato sul runner: CUDA 12.8 non supporta versioni piu' recenti
+            exit /b 1
+          )
           echo Visual Studio: %VSPATH%
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b 1
@@ -99,8 +115,7 @@ jobs:
             -DUSE_CUDA=ON ^
             -DUSE_NCCL=OFF ^
             -DPLUGIN_RMM=OFF ^
-            -DCMAKE_CUDA_ARCHITECTURES=120 ^
-            -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler"
+            -DCMAKE_CUDA_ARCHITECTURES=120
           if errorlevel 1 exit /b 1
           cmake --build build --parallel 4
           if errorlevel 1 exit /b 1
