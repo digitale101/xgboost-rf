@@ -12,15 +12,18 @@ name: build-xgboost-rf-cuda
 # (out->SetDevice(ctx_->Device())). Nessun codice CUDA da scrivere.
 #
 # Scelte:
-# - CUDA 12.8.1: la prima serie con l'architettura Blackwell consumer
-#   (sm_120, RTX 50xx). Richiede un driver NVIDIA >= 570 sul PC.
+# - [RF_CUDA_129] CUDA 12.9.1: XGBoost 3.2.0 richiede CUDA >= 12.9 (il suo
+#   CMakeLists.txt si ferma con "CUDA version must be at least 12.9!",
+#   prova del 6/10/2026 con 12.8.1). Supporta l'architettura Blackwell
+#   consumer (sm_120, RTX 50xx), arrivata con la serie 12.8. Richiede un
+#   driver NVIDIA >= 575 sul PC (installato: 591.86).
 # - CMAKE_CUDA_ARCHITECTURES=120: solo la scheda di destinazione (5070 Ti).
 #   "120" in CMake = codice macchina sm_120 + PTX compute_120. Compilare una
 #   sola architettura accorcia molto la build.
 # - Generatore Ninja con l'ambiente MSVC (vcvars64): evita l'integrazione
 #   CUDA di Visual Studio/MSBuild, fonte tipica di errori sui runner.
 # - [RF_CUDA_VS2022] Compilatore Microsoft di Visual Studio 2022 (toolset
-#   14.4x), quello che CUDA 12.8 supporta ufficialmente. Per questo il runner
+#   14.4x), quello che CUDA 12.8/12.9 supporta ufficialmente. Per questo il runner
 #   e' windows-2022 e vswhere cerca solo VS 2022 (versione [17.0,18.0)).
 #   Prima prova (6/10/2026) su windows-2025: l'immagine ha Visual Studio
 #   2026 (MSVC 19.51, toolset 14.51). nvcc lo rifiuta ("only the versions
@@ -51,7 +54,7 @@ on:
 jobs:
   build:
     # [RF_CUDA_VS2022] windows-2022 = Visual Studio 2022, supportato da
-    # CUDA 12.8 (windows-2025 ha VS 2026: non supportato, vedi sopra)
+    # CUDA 12.9 (windows-2025 ha VS 2026: non supportato, vedi sopra)
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
@@ -73,11 +76,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: CUDA Toolkit 12.8.1
+      - name: CUDA Toolkit 12.9.1   # [RF_CUDA_129]
         id: cuda
         uses: Jimver/cuda-toolkit@v0.2.29
         with:
-          cuda: '12.8.1'
+          cuda: '12.9.1'
           method: 'local'
 
       - name: Verifica toolkit
@@ -96,7 +99,7 @@ jobs:
       - name: Trova Visual Studio 2022
         run: |
           # [RF_CUDA_VS2022] solo Visual Studio 2022 (versioni 17.x): e' il
-          # compilatore supportato da CUDA 12.8. Se manca, stop subito.
+          # compilatore supportato da CUDA 12.9. Se manca, stop subito.
           # La ricerca sta in PowerShell e non nel "for /f" di cmd: con piu'
           # coppie di virgolette nel comando (percorso di vswhere + "-version
           # [17.0,18.0)") cmd toglie la prima e l'ultima e spezza il percorso
@@ -105,7 +108,7 @@ jobs:
           $vs = & $vswhere -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) {
             & $vswhere -products * -format text | Select-String "installationPath|installationVersion"
-            throw "ERRORE [RF_CUDA_VS2022] Visual Studio 2022 non trovato sul runner: CUDA 12.8 non supporta versioni piu' recenti"
+            throw "ERRORE [RF_CUDA_VS2022] Visual Studio 2022 non trovato sul runner: CUDA 12.9 non supporta versioni piu' recenti"
           }
           $vs = ($vs | Select-Object -First 1).Trim()
           "Visual Studio 2022: $vs"
