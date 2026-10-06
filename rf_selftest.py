@@ -23,6 +23,21 @@ feature del gruppo d mod 3. Esce con errore se qualcosa non torna.
      trasferito nella classe standard (save_raw -> load_model), deve dare
      predizioni identiche. E' il percorso del trainer verso joblib e ONNX.
 Uso interno: "python rf_selftest.py --child <file gruppi>" esegue solo B.
+
+[RF_CUDA] Build CUDA (workflow build-cuda.yml). Due opzioni, combinabili:
+  --expect-cuda  la libreria DEVE essere compilata con CUDA
+                 (build_info()["USE_CUDA"]). Usata dal workflow CUDA: il
+                 runner di GitHub non ha GPU, quindi li' le prove A-E girano
+                 sulla CPU (stesso sorgente patchato) e si controlla solo
+                 che la build sia davvero CUDA.
+  --gpu          prove SULLA GPU, da lanciare sul PC con la scheda:
+     G1) con gruppi, device cuda: nessuno split fuori gruppo e booster
+         addestrato davvero sulla GPU (fail_on_invalid_gpu_id + device
+         letto da save_config: nessun ripiego silenzioso sulla CPU);
+     G2) senza gruppi sulla GPU: la regola NON deve valere;
+     G3) modello addestrato sulla GPU trasferito nella classe standard:
+         predizioni identiche (scarto <= 1e-6).
+  Esempio sul PC:  python rf_selftest.py --gpu --expect-cuda
 """
 import os, sys, subprocess, tempfile
 
@@ -73,6 +88,25 @@ def lib_file(mod):
 
 
 # ---- processo figlio: prova B (variabile gia' presente all'avvio) ----------
+# [RF_CUDA] opzioni (il processo figlio --child non le riceve)
+EXPECT_CUDA = "--expect-cuda" in sys.argv
+RUN_GPU = "--gpu" in sys.argv
+
+
+def booster_device(bst):
+    """[RF_CUDA] device di un booster APPENA addestrato (save_config)."""
+    import json, re
+    txt = bst.save_config()
+    try:
+        dev = json.loads(txt).get("learner", {}).get("generic_param", {}).get("device")
+        if dev:
+            return str(dev)
+    except Exception:
+        pass
+    m = re.search(r'"device"\s*:\s*"([^"]+)"', txt)
+    return m.group(1) if m else ""
+
+
 if len(sys.argv) >= 3 and sys.argv[1] == "--child":
     import importlib
     rf = importlib.import_module(RF_MOD)
@@ -148,6 +182,63 @@ os.environ.pop("XGB_RF_GROUPS_BY_LEVEL")
 
 print(f"{RF_MOD} {rf.__version__}  |  xgboost {xgb.__version__}")
 
+# [RF_CUDA] build CUDA?
+try:
+    _bi = rf.build_info()
+except Exception as _e:
+    _bi = {"errore": str(_e)}
+use_cuda = str(_bi.get("USE_CUDA")).strip().lower() in ("1", "true", "on", "yes")
+print(f"CUDA {RF_MOD}: USE_CUDA={_bi.get('USE_CUDA')} CUDA_VERSION={_bi.get('CUDA_VERSION', '-')}")
+
+# [RF_CUDA] prove sulla GPU (solo con --gpu, sul PC con la scheda)
+gpu_errors = []
+if RUN_GPU:
+    PG = dict(PARAMS, device="cuda", fail_on_invalid_gpu_id=True)
+    X, y = make_data()
+    try:
+        os.environ["XGB_RF_GROUPS_BY_LEVEL"] = path
+        try:
+            b_g1 = rf.train(PG, rf.DMatrix(X, label=y), 60)
+        finally:
+            os.environ.pop("XGB_RF_GROUPS_BY_LEVEL", None)
+        dev1 = booster_device(b_g1)
+        okG1, badG1 = violations(b_g1)
+        print(f"G1 GPU con gruppi: device {dev1}, split conformi {okG1}, NON conformi {badG1}")
+        if not dev1.lower().startswith("cuda"):
+            gpu_errors.append(f"G1: addestrato su '{dev1 or 'non rilevato'}', non sulla GPU")
+        if badG1 != 0 or okG1 == 0:
+            gpu_errors.append("G1: sulla GPU la regola per livello non e' rispettata")
+
+        b_g2 = rf.train(PG, rf.DMatrix(X, label=y), 60)
+        dev2 = booster_device(b_g2)
+        okG2, badG2 = violations(b_g2)
+        print(f"G2 GPU senza gruppi: device {dev2}, split conformi {okG2}, NON conformi {badG2}")
+        if not dev2.lower().startswith("cuda"):
+            gpu_errors.append(f"G2: addestrato su '{dev2 or 'non rilevato'}', non sulla GPU")
+        if badG2 == 0:
+            gpu_errors.append("G2: anche senza gruppi nessuna violazione (la prova non discrimina)")
+
+        os.environ["XGB_RF_GROUPS_BY_LEVEL"] = path
+        try:
+            m_g = rf.XGBRegressor(n_estimators=60, **PG).fit(X, y)
+        finally:
+            os.environ.pop("XGB_RF_GROUPS_BY_LEVEL", None)
+        dev3 = booster_device(m_g.get_booster())
+        p_g = m_g.predict(X)
+        m_gs = xgb.XGBRegressor()
+        m_gs.load_model(bytearray(m_g.get_booster().save_raw()))
+        p_gs = m_gs.predict(X)
+        d3 = float(np.max(np.abs(p_g.astype(np.float64) - p_gs.astype(np.float64))))
+        okG3, badG3 = violations(m_gs.get_booster())
+        print(f"G3 GPU -> classe standard: device {dev3}, scarto massimo {d3:.3g}, "
+              f"split NON conformi {badG3}")
+        if not dev3.lower().startswith("cuda"):
+            gpu_errors.append(f"G3: addestrato su '{dev3 or 'non rilevato'}', non sulla GPU")
+        if d3 > 1e-6 or badG3 != 0:
+            gpu_errors.append("G3: il modello GPU trasferito nella classe standard non e' identico")
+    except Exception as _e:
+        gpu_errors.append(f"GPU: prova non eseguibile ({type(_e).__name__}: {_e})")
+
 passA = (badA == 0 and okA > 0)
 passB = (badB == 0 and (okB or 0) > 0)
 errors = []
@@ -170,9 +261,15 @@ if not libs_differ:
     errors.append("D: le due versioni usano la stessa libreria nativa")
 if not same or badE != 0:
     errors.append("E: il modello trasferito nella classe standard non e' identico")
+# [RF_CUDA]
+if (EXPECT_CUDA or RUN_GPU) and not use_cuda:
+    errors.append(f"CUDA: {RF_MOD} non e' compilato con CUDA (USE_CUDA={_bi.get('USE_CUDA')})")
+errors.extend(gpu_errors)
 if errors:
     for e in errors:
         print("ERRORE", e)
     sys.exit("SELFTEST FALLITO")
 print("SELFTEST OK: xgboost_rf rispetta i gruppi (anche impostati dopo l'import), "
-      "convive con xgboost standard e i modelli si trasferiscono identici")
+      "convive con xgboost standard e i modelli si trasferiscono identici"
+      + (" | build CUDA" if use_cuda else "")
+      + (" | prove GPU G1-G3 superate" if RUN_GPU else ""))
